@@ -407,3 +407,104 @@
         )
     )
 )
+
+(define-data-var last-update-id uint u0)
+
+(define-map creation-updates
+    { update-id: uint }
+    {
+        creation-id: uint,
+        updater: principal,
+        new-ipfs-hash: (string-ascii 64),
+        update-description: (string-ascii 200),
+        version-number: uint,
+        updated-at: uint
+    }
+)
+
+(define-map creation-versions
+    { creation-id: uint }
+    { 
+        current-version: uint,
+        update-count: uint,
+        latest-update-id: (optional uint)
+    }
+)
+
+(define-public (update-creation (creation-id uint) (new-ipfs-hash (string-ascii 64)) (update-description (string-ascii 200)))
+    (let
+        (
+            (creation (unwrap! (get-creation creation-id) (err u300)))
+            (version-info (default-to { current-version: u1, update-count: u0, latest-update-id: none } 
+                                    (map-get? creation-versions { creation-id: creation-id })))
+            (new-update-id (+ (var-get last-update-id) u1))
+            (new-version (+ (get current-version version-info) u1))
+        )
+        (asserts! (is-eq tx-sender (get owner creation)) (err u301))
+        (asserts! (>= (len new-ipfs-hash) u1) (err u302))
+        (asserts! (>= (len update-description) u1) (err u303))
+        
+        (map-set creation-updates
+            { update-id: new-update-id }
+            {
+                creation-id: creation-id,
+                updater: tx-sender,
+                new-ipfs-hash: new-ipfs-hash,
+                update-description: update-description,
+                version-number: new-version,
+                updated-at: burn-block-height
+            }
+        )
+        
+        (map-set creation-versions
+            { creation-id: creation-id }
+            {
+                current-version: new-version,
+                update-count: (+ (get update-count version-info) u1),
+                latest-update-id: (some new-update-id)
+            }
+        )
+        
+        (var-set last-update-id new-update-id)
+        (ok new-update-id)
+    )
+)
+
+(define-read-only (get-creation-update (update-id uint))
+    (map-get? creation-updates { update-id: update-id })
+)
+
+(define-read-only (get-creation-version-info (creation-id uint))
+    (map-get? creation-versions { creation-id: creation-id })
+)
+
+(define-read-only (get-current-ipfs-hash (creation-id uint))
+    (let
+        ((version-info (map-get? creation-versions { creation-id: creation-id })))
+        (if (is-some version-info)
+            (let
+                ((latest-update-id (get latest-update-id (unwrap-panic version-info))))
+                (if (is-some latest-update-id)
+                    (let
+                        ((update (map-get? creation-updates { update-id: (unwrap-panic latest-update-id) })))
+                        (if (is-some update)
+                            (ok (get new-ipfs-hash (unwrap-panic update)))
+                            (let
+                                ((creation (unwrap! (get-creation creation-id) (err u304))))
+                                (ok (get ipfs-hash creation))
+                            )
+                        )
+                    )
+                    (let
+                        ((creation (unwrap! (get-creation creation-id) (err u305))))
+                        (ok (get ipfs-hash creation))
+                    )
+                )
+            )
+            (let
+                ((creation (unwrap! (get-creation creation-id) (err u306))))
+                (ok (get ipfs-hash creation))
+            )
+        )
+    )
+)
