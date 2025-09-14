@@ -478,6 +478,185 @@
     (map-get? creation-versions { creation-id: creation-id })
 )
 
+(define-data-var last-proposal-id uint u0)
+
+(define-map collaborative-creations
+    { creation-id: uint }
+    {
+        co-creators: (list 10 principal),
+        required-signatures: uint,
+        is-collaborative: bool
+    }
+)
+
+(define-map multisig-proposals
+    { proposal-id: uint }
+    {
+        creation-id: uint,
+        proposer: principal,
+        action-type: (string-ascii 20),
+        target-principal: (optional principal),
+        target-value: (optional uint),
+        signatures: (list 10 principal),
+        executed: bool,
+        created-at: uint,
+        expires-at: uint
+    }
+)
+
+(define-public (register-collaborative-creation (ipfs-hash (string-ascii 64)) (title (string-ascii 100)) (category (string-ascii 20)) (co-creators (list 10 principal)) (required-signatures uint))
+    (let
+        (
+            (new-id (+ (var-get last-creation-id) u1))
+            (creator tx-sender)
+            (total-creators (+ (len co-creators) u1))
+            (existing-works (default-to { work-ids: (list) } (map-get? creator-works { creator: tx-sender })))
+        )
+        (asserts! (>= (len ipfs-hash) u1) (err u1))
+        (asserts! (>= (len title) u1) (err u2))
+        (asserts! (>= (len category) u1) (err u3))
+        (asserts! (and (> required-signatures u0) (<= required-signatures total-creators)) (err u400))
+        (asserts! (<= (len co-creators) u9) (err u401))
+        
+        (map-set creations
+            { creation-id: new-id }
+            {
+                owner: creator,
+                ipfs-hash: ipfs-hash,
+                title: title,
+                timestamp: burn-block-height,
+                category: category
+            }
+        )
+        
+        (map-set collaborative-creations
+            { creation-id: new-id }
+            {
+                co-creators: (unwrap-panic (as-max-len? (append co-creators creator) u10)),
+                required-signatures: required-signatures,
+                is-collaborative: true
+            }
+        )
+        
+        (map-set creator-works
+            { creator: creator }
+            { work-ids: (unwrap-panic (as-max-len? (append (get work-ids existing-works) new-id) u100)) }
+        )
+        
+        (var-set last-creation-id new-id)
+        (ok new-id)
+    )
+)
+
+(define-public (create-proposal (creation-id uint) (action-type (string-ascii 20)) (target-principal (optional principal)) (target-value (optional uint)))
+    (let
+        (
+            (collab-info (unwrap! (map-get? collaborative-creations { creation-id: creation-id }) (err u402)))
+            (new-proposal-id (+ (var-get last-proposal-id) u1))
+            (co-creators-list (get co-creators collab-info))
+        )
+        (asserts! (is-some (index-of co-creators-list tx-sender)) (err u403))
+        (asserts! (get is-collaborative collab-info) (err u404))
+        
+        (map-set multisig-proposals
+            { proposal-id: new-proposal-id }
+            {
+                creation-id: creation-id,
+                proposer: tx-sender,
+                action-type: action-type,
+                target-principal: target-principal,
+                target-value: target-value,
+                signatures: (list tx-sender),
+                executed: false,
+                created-at: burn-block-height,
+                expires-at: (+ burn-block-height u1008)
+            }
+        )
+        
+        (var-set last-proposal-id new-proposal-id)
+        (ok new-proposal-id)
+    )
+)
+
+(define-public (sign-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? multisig-proposals { proposal-id: proposal-id }) (err u405)))
+            (collab-info (unwrap! (map-get? collaborative-creations { creation-id: (get creation-id proposal) }) (err u406)))
+            (co-creators-list (get co-creators collab-info))
+            (current-signatures (get signatures proposal))
+        )
+        (asserts! (is-some (index-of co-creators-list tx-sender)) (err u407))
+        (asserts! (is-none (index-of current-signatures tx-sender)) (err u408))
+        (asserts! (not (get executed proposal)) (err u409))
+        (asserts! (< burn-block-height (get expires-at proposal)) (err u410))
+        
+        (map-set multisig-proposals
+            { proposal-id: proposal-id }
+            (merge proposal { 
+                signatures: (unwrap-panic (as-max-len? (append current-signatures tx-sender) u10))
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? multisig-proposals { proposal-id: proposal-id }) (err u411)))
+            (collab-info (unwrap! (map-get? collaborative-creations { creation-id: (get creation-id proposal) }) (err u412)))
+            (signature-count (len (get signatures proposal)))
+            (required-sigs (get required-signatures collab-info))
+        )
+        (asserts! (not (get executed proposal)) (err u413))
+        (asserts! (>= signature-count required-sigs) (err u414))
+        (asserts! (< burn-block-height (get expires-at proposal)) (err u415))
+        
+        (map-set multisig-proposals
+            { proposal-id: proposal-id }
+            (merge proposal { executed: true })
+        )
+        
+        (if (is-eq (get action-type proposal) "transfer")
+            (match (get target-principal proposal)
+                new-owner (transfer-creation (get creation-id proposal) new-owner)
+                (err u416)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-collaboration-info (creation-id uint))
+    (map-get? collaborative-creations { creation-id: creation-id })
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+    (map-get? multisig-proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (is-collaborative-creation (creation-id uint))
+    (match (map-get? collaborative-creations { creation-id: creation-id })
+        collab-info (get is-collaborative collab-info)
+        false
+    )
+)
+
+(define-read-only (is-co-creator (creation-id uint) (principal-to-check principal))
+    (match (map-get? collaborative-creations { creation-id: creation-id })
+        collab-info (is-some (index-of (get co-creators collab-info) principal-to-check))
+        false
+    )
+)
+
+(define-read-only (get-proposal-signature-count (proposal-id uint))
+    (match (map-get? multisig-proposals { proposal-id: proposal-id })
+        proposal (len (get signatures proposal))
+        u0
+    )
+)
+
 (define-read-only (get-current-ipfs-hash (creation-id uint))
     (let
         ((version-info (map-get? creation-versions { creation-id: creation-id })))
