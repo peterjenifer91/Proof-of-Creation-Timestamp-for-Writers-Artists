@@ -687,3 +687,207 @@
         )
     )
 )
+
+(define-data-var last-dispute-id uint u0)
+(define-data-var dispute-filing-fee uint u5000)
+
+(define-map disputes
+    { dispute-id: uint }
+    {
+        creation-id: uint,
+        complainant: principal,
+        defendant: principal,
+        dispute-reason: (string-ascii 200),
+        evidence-ipfs: (string-ascii 64),
+        status: (string-ascii 20),
+        mediator: (optional principal),
+        resolution: (optional (string-ascii 200)),
+        stake-amount: uint,
+        filed-at: uint,
+        resolved-at: (optional uint)
+    }
+)
+
+(define-map dispute-votes
+    { dispute-id: uint, voter: principal }
+    { vote-for-complainant: bool }
+)
+
+(define-map dispute-vote-counts
+    { dispute-id: uint }
+    {
+        complainant-votes: uint,
+        defendant-votes: uint,
+        total-votes: uint
+    }
+)
+
+(define-public (file-dispute (creation-id uint) (defendant principal) (dispute-reason (string-ascii 200)) (evidence-ipfs (string-ascii 64)))
+    (let
+        (
+            (creation (unwrap! (get-creation creation-id) (err u500)))
+            (new-dispute-id (+ (var-get last-dispute-id) u1))
+            (filing-fee (var-get dispute-filing-fee))
+        )
+        (asserts! (is-eq tx-sender (get owner creation)) (err u501))
+        (asserts! (not (is-eq tx-sender defendant)) (err u502))
+        (asserts! (>= (len dispute-reason) u10) (err u503))
+        (asserts! (>= (len evidence-ipfs) u1) (err u504))
+        
+        (try! (stx-transfer? filing-fee tx-sender (as-contract tx-sender)))
+        
+        (map-set disputes
+            { dispute-id: new-dispute-id }
+            {
+                creation-id: creation-id,
+                complainant: tx-sender,
+                defendant: defendant,
+                dispute-reason: dispute-reason,
+                evidence-ipfs: evidence-ipfs,
+                status: "open",
+                mediator: none,
+                resolution: none,
+                stake-amount: filing-fee,
+                filed-at: burn-block-height,
+                resolved-at: none
+            }
+        )
+        
+        (map-set dispute-vote-counts
+            { dispute-id: new-dispute-id }
+            {
+                complainant-votes: u0,
+                defendant-votes: u0,
+                total-votes: u0
+            }
+        )
+        
+        (var-set last-dispute-id new-dispute-id)
+        (ok new-dispute-id)
+    )
+)
+
+(define-public (accept-mediation (dispute-id uint))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err u505)))
+            (validator-info (unwrap! (map-get? validators { validator: tx-sender }) (err u506)))
+        )
+        (asserts! (get is-active validator-info) (err u507))
+        (asserts! (is-eq (get status dispute) "open") (err u508))
+        (asserts! (is-none (get mediator dispute)) (err u509))
+        
+        (map-set disputes
+            { dispute-id: dispute-id }
+            (merge dispute {
+                mediator: (some tx-sender),
+                status: "in-mediation"
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (vote-on-dispute (dispute-id uint) (vote-for-complainant bool))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err u510)))
+            (validator-info (unwrap! (map-get? validators { validator: tx-sender }) (err u511)))
+            (vote-counts (unwrap! (map-get? dispute-vote-counts { dispute-id: dispute-id }) (err u512)))
+        )
+        (asserts! (get is-active validator-info) (err u513))
+        (asserts! (is-eq (get status dispute) "in-mediation") (err u514))
+        (asserts! (is-none (map-get? dispute-votes { dispute-id: dispute-id, voter: tx-sender })) (err u515))
+        
+        (map-set dispute-votes
+            { dispute-id: dispute-id, voter: tx-sender }
+            { vote-for-complainant: vote-for-complainant }
+        )
+        
+        (map-set dispute-vote-counts
+            { dispute-id: dispute-id }
+            {
+                complainant-votes: (if vote-for-complainant (+ (get complainant-votes vote-counts) u1) (get complainant-votes vote-counts)),
+                defendant-votes: (if vote-for-complainant (get defendant-votes vote-counts) (+ (get defendant-votes vote-counts) u1)),
+                total-votes: (+ (get total-votes vote-counts) u1)
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint) (resolution-text (string-ascii 200)))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err u516)))
+            (vote-counts (unwrap! (map-get? dispute-vote-counts { dispute-id: dispute-id }) (err u517)))
+            (complainant-wins (> (get complainant-votes vote-counts) (get defendant-votes vote-counts)))
+        )
+        (asserts! (is-eq (some tx-sender) (get mediator dispute)) (err u518))
+        (asserts! (is-eq (get status dispute) "in-mediation") (err u519))
+        (asserts! (>= (get total-votes vote-counts) u3) (err u520))
+        (asserts! (>= (len resolution-text) u10) (err u521))
+        
+        (map-set disputes
+            { dispute-id: dispute-id }
+            (merge dispute {
+                status: "resolved",
+                resolution: (some resolution-text),
+                resolved-at: (some burn-block-height)
+            })
+        )
+        
+        (if complainant-wins
+            (try! (as-contract (stx-transfer? (get stake-amount dispute) tx-sender (get complainant dispute))))
+            (try! (as-contract (stx-transfer? (get stake-amount dispute) tx-sender (get defendant dispute))))
+        )
+        
+        (ok complainant-wins)
+    )
+)
+
+(define-public (respond-to-dispute (dispute-id uint) (response-ipfs (string-ascii 64)))
+    (let
+        ((dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err u522))))
+        (asserts! (is-eq tx-sender (get defendant dispute)) (err u523))
+        (asserts! (is-eq (get status dispute) "open") (err u524))
+        (asserts! (>= (len response-ipfs) u1) (err u525))
+        
+        (try! (stx-transfer? (get stake-amount dispute) tx-sender (as-contract tx-sender)))
+        
+        (map-set disputes
+            { dispute-id: dispute-id }
+            (merge dispute { status: "contested" })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-dispute-votes (dispute-id uint))
+    (map-get? dispute-vote-counts { dispute-id: dispute-id })
+)
+
+(define-read-only (has-voted-on-dispute (dispute-id uint) (voter principal))
+    (is-some (map-get? dispute-votes { dispute-id: dispute-id, voter: voter }))
+)
+
+(define-read-only (get-total-disputes)
+    (var-get last-dispute-id)
+)
+
+(define-read-only (get-dispute-by-creation (creation-id uint) (search-dispute-id uint))
+    (let
+        ((dispute (map-get? disputes { dispute-id: search-dispute-id })))
+        (if (is-some dispute)
+            (if (is-eq creation-id (get creation-id (unwrap-panic dispute)))
+                dispute
+                none
+            )
+            none
+        )
+    )
+)
