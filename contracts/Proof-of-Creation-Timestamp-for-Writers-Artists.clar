@@ -1,0 +1,1086 @@
+(define-data-var last-creation-id uint u0)
+
+(define-map creations
+    { creation-id: uint }
+    {
+        owner: principal,
+        ipfs-hash: (string-ascii 64),
+        title: (string-ascii 100),
+        timestamp: uint,
+        category: (string-ascii 20)
+    }
+)
+
+(define-map creator-works
+    { creator: principal }
+    { work-ids: (list 100 uint) }
+)
+
+(define-public (register-creation (ipfs-hash (string-ascii 64)) (title (string-ascii 100)) (category (string-ascii 20)))
+    (let
+        (
+            (new-id (+ (var-get last-creation-id) u1))
+            (creator tx-sender)
+            (existing-works (default-to { work-ids: (list) } (map-get? creator-works { creator: tx-sender })))
+        )
+        (asserts! (>= (len ipfs-hash) u1) (err u1))
+        (asserts! (>= (len title) u1) (err u2))
+        (asserts! (>= (len category) u1) (err u3))
+        
+        (map-set creations
+            { creation-id: new-id }
+            {
+                owner: creator,
+                ipfs-hash: ipfs-hash,
+                title: title,
+                timestamp: burn-block-height,
+                category: category
+            }
+        )
+        
+        (map-set creator-works
+            { creator: creator }
+            { work-ids: (unwrap-panic (as-max-len? (append (get work-ids existing-works) new-id) u100)) }
+        )
+        
+        (var-set last-creation-id new-id)
+        (ok new-id)
+    )
+)
+
+(define-read-only (get-creation (creation-id uint))
+    (map-get? creations { creation-id: creation-id })
+)
+
+(define-read-only (get-creator-works (creator principal))
+    (map-get? creator-works { creator: creator })
+)
+
+(define-read-only (verify-timestamp (creation-id uint) (claimed-height uint))
+    (let
+        ((creation (map-get? creations { creation-id: creation-id })))
+        (if (is-some creation)
+            (ok (is-eq claimed-height (get timestamp (unwrap-panic creation))))
+            (err u4)
+        )
+    )
+)
+
+(define-public (transfer-creation (creation-id uint) (new-owner principal))
+    (let
+        ((creation (map-get? creations { creation-id: creation-id })))
+        (asserts! (is-some creation) (err u5))
+        (asserts! (is-eq tx-sender (get owner (unwrap-panic creation))) (err u6))
+        
+        (map-set creations
+            { creation-id: creation-id }
+            (merge (unwrap-panic creation) { owner: new-owner })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-creation-count)
+    (var-get last-creation-id)
+)
+
+(define-data-var verification-fee uint u1000)
+(define-data-var validator-count uint u0)
+
+(define-map validators
+    { validator: principal }
+    { 
+        is-active: bool,
+        verifications-count: uint,
+        reputation-score: uint
+    }
+)
+
+(define-map verification-requests
+    { request-id: uint }
+    {
+        creation-id: uint,
+        requester: principal,
+        validator: (optional principal),
+        status: (string-ascii 20),
+        fee-paid: uint,
+        submitted-at: uint
+    }
+)
+
+(define-map creation-verifications
+    { creation-id: uint }
+    {
+        is-verified: bool,
+        verified-by: (optional principal),
+        verified-at: (optional uint),
+        verification-level: (string-ascii 20)
+    }
+)
+
+(define-data-var last-verification-request-id uint u0)
+
+(define-public (add-validator (validator principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-caller) (err u100))
+        (map-set validators
+            { validator: validator }
+            {
+                is-active: true,
+                verifications-count: u0,
+                reputation-score: u100
+            }
+        )
+        (var-set validator-count (+ (var-get validator-count) u1))
+        (ok true)
+    )
+)
+
+(define-public (request-verification (creation-id uint))
+    (let
+        (
+            (new-request-id (+ (var-get last-verification-request-id) u1))
+            (fee (var-get verification-fee))
+        )
+        (asserts! (is-some (get-creation creation-id)) (err u101))
+        (asserts! (is-none (map-get? creation-verifications { creation-id: creation-id })) (err u102))
+        
+        (try! (stx-transfer? fee tx-sender (as-contract tx-sender)))
+        
+        (map-set verification-requests
+            { request-id: new-request-id }
+            {
+                creation-id: creation-id,
+                requester: tx-sender,
+                validator: none,
+                status: "pending",
+                fee-paid: fee,
+                submitted-at: burn-block-height
+            }
+        )
+        
+        (var-set last-verification-request-id new-request-id)
+        (ok new-request-id)
+    )
+)
+
+(define-public (accept-verification (request-id uint))
+    (let
+        ((request (unwrap! (map-get? verification-requests { request-id: request-id }) (err u103))))
+        (asserts! (is-some (map-get? validators { validator: tx-sender })) (err u104))
+        (asserts! (is-eq (get status request) "pending") (err u105))
+        
+        (map-set verification-requests
+            { request-id: request-id }
+            (merge request { 
+                validator: (some tx-sender),
+                status: "in-progress"
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (complete-verification (request-id uint) (verification-result bool))
+    (let
+        (
+            (request (unwrap! (map-get? verification-requests { request-id: request-id }) (err u106)))
+            (validator-info (unwrap! (map-get? validators { validator: tx-sender }) (err u107)))
+        )
+        (asserts! (is-eq (some tx-sender) (get validator request)) (err u108))
+        (asserts! (is-eq (get status request) "in-progress") (err u109))
+        
+        (map-set verification-requests
+            { request-id: request-id }
+            (merge request { status: "completed" })
+        )
+        
+        (map-set creation-verifications
+            { creation-id: (get creation-id request) }
+            {
+                is-verified: verification-result,
+                verified-by: (some tx-sender),
+                verified-at: (some burn-block-height),
+                verification-level: "standard"
+            }
+        )
+        
+        (map-set validators
+            { validator: tx-sender }
+            (merge validator-info { 
+                verifications-count: (+ (get verifications-count validator-info) u1)
+            })
+        )
+        
+        (if verification-result
+            (try! (as-contract (stx-transfer? (get fee-paid request) tx-sender (get requester request))))
+            (try! (as-contract (stx-transfer? (/ (get fee-paid request) u2) tx-sender tx-sender)))
+        )
+        
+        (ok verification-result)
+    )
+)
+
+(define-read-only (get-verification-status (creation-id uint))
+    (map-get? creation-verifications { creation-id: creation-id })
+)
+
+(define-read-only (get-verification-request (request-id uint))
+    (map-get? verification-requests { request-id: request-id })
+)
+
+(define-read-only (is-validator (validator principal))
+    (is-some (map-get? validators { validator: validator }))
+)
+
+(define-data-var platform-fee-percentage uint u250)
+
+(define-map creation-royalties
+    { creation-id: uint }
+    {
+        royalty-percentage: uint,
+        license-price: uint,
+        is-for-sale: bool,
+        exclusive-license: bool,
+        commercial-allowed: bool
+    }
+)
+
+(define-map licenses
+    { license-id: uint }
+    {
+        creation-id: uint,
+        licensee: principal,
+        license-type: (string-ascii 20),
+        price-paid: uint,
+        expires-at: (optional uint),
+        granted-at: uint
+    }
+)
+
+(define-map royalty-earnings
+    { creator: principal }
+    { total-earned: uint }
+)
+
+(define-data-var last-license-id uint u0)
+
+(define-public (set-royalty-terms (creation-id uint) (royalty-percentage uint) (license-price uint) (commercial-allowed bool))
+    (let
+        ((creation (unwrap! (get-creation creation-id) (err u200))))
+        (asserts! (is-eq tx-sender (get owner creation)) (err u201))
+        (asserts! (<= royalty-percentage u5000) (err u202))
+        
+        (map-set creation-royalties
+            { creation-id: creation-id }
+            {
+                royalty-percentage: royalty-percentage,
+                license-price: license-price,
+                is-for-sale: true,
+                exclusive-license: false,
+                commercial-allowed: commercial-allowed
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (purchase-license (creation-id uint) (license-type (string-ascii 20)))
+    (let
+        (
+            (creation (unwrap! (get-creation creation-id) (err u203)))
+            (royalty-info (unwrap! (map-get? creation-royalties { creation-id: creation-id }) (err u204)))
+            (license-price (get license-price royalty-info))
+            (creator (get owner creation))
+            (new-license-id (+ (var-get last-license-id) u1))
+            (platform-fee (/ (* license-price (var-get platform-fee-percentage)) u10000))
+            (creator-payment (- license-price platform-fee))
+        )
+        (asserts! (get is-for-sale royalty-info) (err u205))
+        (asserts! (not (is-eq tx-sender creator)) (err u206))
+        
+        (try! (stx-transfer? license-price tx-sender (as-contract tx-sender)))
+        (try! (as-contract (stx-transfer? creator-payment tx-sender creator)))
+        
+        (map-set licenses
+            { license-id: new-license-id }
+            {
+                creation-id: creation-id,
+                licensee: tx-sender,
+                license-type: license-type,
+                price-paid: license-price,
+                expires-at: none,
+                granted-at: burn-block-height
+            }
+        )
+        
+        (let
+            ((current-earnings (default-to { total-earned: u0 } (map-get? royalty-earnings { creator: creator }))))
+            (map-set royalty-earnings
+                { creator: creator }
+                { total-earned: (+ (get total-earned current-earnings) creator-payment) }
+            )
+        )
+        
+        (var-set last-license-id new-license-id)
+        (ok new-license-id)
+    )
+)
+
+(define-public (set-exclusive-license (creation-id uint) (licensee principal) (price uint) (duration-blocks uint))
+    (let
+        (
+            (creation (unwrap! (get-creation creation-id) (err u207)))
+            (royalty-info (unwrap! (map-get? creation-royalties { creation-id: creation-id }) (err u208)))
+            (creator (get owner creation))
+            (new-license-id (+ (var-get last-license-id) u1))
+            (platform-fee (/ (* price (var-get platform-fee-percentage)) u10000))
+            (creator-payment (- price platform-fee))
+        )
+        (asserts! (is-eq tx-sender creator) (err u209))
+        (asserts! (get is-for-sale royalty-info) (err u210))
+        
+        (try! (stx-transfer? price licensee (as-contract tx-sender)))
+        (try! (as-contract (stx-transfer? creator-payment tx-sender creator)))
+        
+        (map-set licenses
+            { license-id: new-license-id }
+            {
+                creation-id: creation-id,
+                licensee: licensee,
+                license-type: "exclusive",
+                price-paid: price,
+                expires-at: (some (+ burn-block-height duration-blocks)),
+                granted-at: burn-block-height
+            }
+        )
+        
+        (map-set creation-royalties
+            { creation-id: creation-id }
+            (merge royalty-info { exclusive-license: true })
+        )
+        
+        (var-set last-license-id new-license-id)
+        (ok new-license-id)
+    )
+)
+
+(define-public (withdraw-royalties)
+    (let
+        ((earnings (unwrap! (map-get? royalty-earnings { creator: tx-sender }) (err u211))))
+        (asserts! (> (get total-earned earnings) u0) (err u212))
+        
+        (try! (as-contract (stx-transfer? (get total-earned earnings) tx-sender tx-sender)))
+        
+        (map-set royalty-earnings
+            { creator: tx-sender }
+            { total-earned: u0 }
+        )
+        (ok (get total-earned earnings))
+    )
+)
+
+(define-read-only (get-royalty-info (creation-id uint))
+    (map-get? creation-royalties { creation-id: creation-id })
+)
+
+(define-read-only (get-license (license-id uint))
+    (map-get? licenses { license-id: license-id })
+)
+
+(define-read-only (get-creator-earnings (creator principal))
+    (map-get? royalty-earnings { creator: creator })
+)
+
+(define-read-only (check-license-validity (license-id uint))
+    (let
+        ((license (map-get? licenses { license-id: license-id })))
+        (if (is-some license)
+            (let
+                ((license-data (unwrap-panic license)))
+                (if (is-some (get expires-at license-data))
+                    (ok (> (unwrap-panic (get expires-at license-data)) burn-block-height))
+                    (ok true)
+                )
+            )
+            (err u213)
+        )
+    )
+)
+
+(define-data-var last-update-id uint u0)
+
+(define-map creation-updates
+    { update-id: uint }
+    {
+        creation-id: uint,
+        updater: principal,
+        new-ipfs-hash: (string-ascii 64),
+        update-description: (string-ascii 200),
+        version-number: uint,
+        updated-at: uint
+    }
+)
+
+(define-map creation-versions
+    { creation-id: uint }
+    { 
+        current-version: uint,
+        update-count: uint,
+        latest-update-id: (optional uint)
+    }
+)
+
+(define-public (update-creation (creation-id uint) (new-ipfs-hash (string-ascii 64)) (update-description (string-ascii 200)))
+    (let
+        (
+            (creation (unwrap! (get-creation creation-id) (err u300)))
+            (version-info (default-to { current-version: u1, update-count: u0, latest-update-id: none } 
+                                    (map-get? creation-versions { creation-id: creation-id })))
+            (new-update-id (+ (var-get last-update-id) u1))
+            (new-version (+ (get current-version version-info) u1))
+        )
+        (asserts! (is-eq tx-sender (get owner creation)) (err u301))
+        (asserts! (>= (len new-ipfs-hash) u1) (err u302))
+        (asserts! (>= (len update-description) u1) (err u303))
+        
+        (map-set creation-updates
+            { update-id: new-update-id }
+            {
+                creation-id: creation-id,
+                updater: tx-sender,
+                new-ipfs-hash: new-ipfs-hash,
+                update-description: update-description,
+                version-number: new-version,
+                updated-at: burn-block-height
+            }
+        )
+        
+        (map-set creation-versions
+            { creation-id: creation-id }
+            {
+                current-version: new-version,
+                update-count: (+ (get update-count version-info) u1),
+                latest-update-id: (some new-update-id)
+            }
+        )
+        
+        (var-set last-update-id new-update-id)
+        (ok new-update-id)
+    )
+)
+
+(define-read-only (get-creation-update (update-id uint))
+    (map-get? creation-updates { update-id: update-id })
+)
+
+(define-read-only (get-creation-version-info (creation-id uint))
+    (map-get? creation-versions { creation-id: creation-id })
+)
+
+(define-data-var last-proposal-id uint u0)
+
+(define-map collaborative-creations
+    { creation-id: uint }
+    {
+        co-creators: (list 10 principal),
+        required-signatures: uint,
+        is-collaborative: bool
+    }
+)
+
+(define-map multisig-proposals
+    { proposal-id: uint }
+    {
+        creation-id: uint,
+        proposer: principal,
+        action-type: (string-ascii 20),
+        target-principal: (optional principal),
+        target-value: (optional uint),
+        signatures: (list 10 principal),
+        executed: bool,
+        created-at: uint,
+        expires-at: uint
+    }
+)
+
+(define-public (register-collaborative-creation (ipfs-hash (string-ascii 64)) (title (string-ascii 100)) (category (string-ascii 20)) (co-creators (list 10 principal)) (required-signatures uint))
+    (let
+        (
+            (new-id (+ (var-get last-creation-id) u1))
+            (creator tx-sender)
+            (total-creators (+ (len co-creators) u1))
+            (existing-works (default-to { work-ids: (list) } (map-get? creator-works { creator: tx-sender })))
+        )
+        (asserts! (>= (len ipfs-hash) u1) (err u1))
+        (asserts! (>= (len title) u1) (err u2))
+        (asserts! (>= (len category) u1) (err u3))
+        (asserts! (and (> required-signatures u0) (<= required-signatures total-creators)) (err u400))
+        (asserts! (<= (len co-creators) u9) (err u401))
+        
+        (map-set creations
+            { creation-id: new-id }
+            {
+                owner: creator,
+                ipfs-hash: ipfs-hash,
+                title: title,
+                timestamp: burn-block-height,
+                category: category
+            }
+        )
+        
+        (map-set collaborative-creations
+            { creation-id: new-id }
+            {
+                co-creators: (unwrap-panic (as-max-len? (append co-creators creator) u10)),
+                required-signatures: required-signatures,
+                is-collaborative: true
+            }
+        )
+        
+        (map-set creator-works
+            { creator: creator }
+            { work-ids: (unwrap-panic (as-max-len? (append (get work-ids existing-works) new-id) u100)) }
+        )
+        
+        (var-set last-creation-id new-id)
+        (ok new-id)
+    )
+)
+
+(define-public (create-proposal (creation-id uint) (action-type (string-ascii 20)) (target-principal (optional principal)) (target-value (optional uint)))
+    (let
+        (
+            (collab-info (unwrap! (map-get? collaborative-creations { creation-id: creation-id }) (err u402)))
+            (new-proposal-id (+ (var-get last-proposal-id) u1))
+            (co-creators-list (get co-creators collab-info))
+        )
+        (asserts! (is-some (index-of co-creators-list tx-sender)) (err u403))
+        (asserts! (get is-collaborative collab-info) (err u404))
+        
+        (map-set multisig-proposals
+            { proposal-id: new-proposal-id }
+            {
+                creation-id: creation-id,
+                proposer: tx-sender,
+                action-type: action-type,
+                target-principal: target-principal,
+                target-value: target-value,
+                signatures: (list tx-sender),
+                executed: false,
+                created-at: burn-block-height,
+                expires-at: (+ burn-block-height u1008)
+            }
+        )
+        
+        (var-set last-proposal-id new-proposal-id)
+        (ok new-proposal-id)
+    )
+)
+
+(define-public (sign-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? multisig-proposals { proposal-id: proposal-id }) (err u405)))
+            (collab-info (unwrap! (map-get? collaborative-creations { creation-id: (get creation-id proposal) }) (err u406)))
+            (co-creators-list (get co-creators collab-info))
+            (current-signatures (get signatures proposal))
+        )
+        (asserts! (is-some (index-of co-creators-list tx-sender)) (err u407))
+        (asserts! (is-none (index-of current-signatures tx-sender)) (err u408))
+        (asserts! (not (get executed proposal)) (err u409))
+        (asserts! (< burn-block-height (get expires-at proposal)) (err u410))
+        
+        (map-set multisig-proposals
+            { proposal-id: proposal-id }
+            (merge proposal { 
+                signatures: (unwrap-panic (as-max-len? (append current-signatures tx-sender) u10))
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? multisig-proposals { proposal-id: proposal-id }) (err u411)))
+            (collab-info (unwrap! (map-get? collaborative-creations { creation-id: (get creation-id proposal) }) (err u412)))
+            (signature-count (len (get signatures proposal)))
+            (required-sigs (get required-signatures collab-info))
+        )
+        (asserts! (not (get executed proposal)) (err u413))
+        (asserts! (>= signature-count required-sigs) (err u414))
+        (asserts! (< burn-block-height (get expires-at proposal)) (err u415))
+        
+        (map-set multisig-proposals
+            { proposal-id: proposal-id }
+            (merge proposal { executed: true })
+        )
+        
+        (if (is-eq (get action-type proposal) "transfer")
+            (match (get target-principal proposal)
+                new-owner (transfer-creation (get creation-id proposal) new-owner)
+                (err u416)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-collaboration-info (creation-id uint))
+    (map-get? collaborative-creations { creation-id: creation-id })
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+    (map-get? multisig-proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (is-collaborative-creation (creation-id uint))
+    (match (map-get? collaborative-creations { creation-id: creation-id })
+        collab-info (get is-collaborative collab-info)
+        false
+    )
+)
+
+(define-read-only (is-co-creator (creation-id uint) (principal-to-check principal))
+    (match (map-get? collaborative-creations { creation-id: creation-id })
+        collab-info (is-some (index-of (get co-creators collab-info) principal-to-check))
+        false
+    )
+)
+
+(define-read-only (get-proposal-signature-count (proposal-id uint))
+    (match (map-get? multisig-proposals { proposal-id: proposal-id })
+        proposal (len (get signatures proposal))
+        u0
+    )
+)
+
+(define-read-only (get-current-ipfs-hash (creation-id uint))
+    (let
+        ((version-info (map-get? creation-versions { creation-id: creation-id })))
+        (if (is-some version-info)
+            (let
+                ((latest-update-id (get latest-update-id (unwrap-panic version-info))))
+                (if (is-some latest-update-id)
+                    (let
+                        ((update (map-get? creation-updates { update-id: (unwrap-panic latest-update-id) })))
+                        (if (is-some update)
+                            (ok (get new-ipfs-hash (unwrap-panic update)))
+                            (let
+                                ((creation (unwrap! (get-creation creation-id) (err u304))))
+                                (ok (get ipfs-hash creation))
+                            )
+                        )
+                    )
+                    (let
+                        ((creation (unwrap! (get-creation creation-id) (err u305))))
+                        (ok (get ipfs-hash creation))
+                    )
+                )
+            )
+            (let
+                ((creation (unwrap! (get-creation creation-id) (err u306))))
+                (ok (get ipfs-hash creation))
+            )
+        )
+    )
+)
+
+(define-data-var last-dispute-id uint u0)
+(define-data-var dispute-filing-fee uint u5000)
+
+(define-map disputes
+    { dispute-id: uint }
+    {
+        creation-id: uint,
+        complainant: principal,
+        defendant: principal,
+        dispute-reason: (string-ascii 200),
+        evidence-ipfs: (string-ascii 64),
+        status: (string-ascii 20),
+        mediator: (optional principal),
+        resolution: (optional (string-ascii 200)),
+        stake-amount: uint,
+        filed-at: uint,
+        resolved-at: (optional uint)
+    }
+)
+
+(define-map dispute-votes
+    { dispute-id: uint, voter: principal }
+    { vote-for-complainant: bool }
+)
+
+(define-map dispute-vote-counts
+    { dispute-id: uint }
+    {
+        complainant-votes: uint,
+        defendant-votes: uint,
+        total-votes: uint
+    }
+)
+
+(define-public (file-dispute (creation-id uint) (defendant principal) (dispute-reason (string-ascii 200)) (evidence-ipfs (string-ascii 64)))
+    (let
+        (
+            (creation (unwrap! (get-creation creation-id) (err u500)))
+            (new-dispute-id (+ (var-get last-dispute-id) u1))
+            (filing-fee (var-get dispute-filing-fee))
+        )
+        (asserts! (is-eq tx-sender (get owner creation)) (err u501))
+        (asserts! (not (is-eq tx-sender defendant)) (err u502))
+        (asserts! (>= (len dispute-reason) u10) (err u503))
+        (asserts! (>= (len evidence-ipfs) u1) (err u504))
+        
+        (try! (stx-transfer? filing-fee tx-sender (as-contract tx-sender)))
+        
+        (map-set disputes
+            { dispute-id: new-dispute-id }
+            {
+                creation-id: creation-id,
+                complainant: tx-sender,
+                defendant: defendant,
+                dispute-reason: dispute-reason,
+                evidence-ipfs: evidence-ipfs,
+                status: "open",
+                mediator: none,
+                resolution: none,
+                stake-amount: filing-fee,
+                filed-at: burn-block-height,
+                resolved-at: none
+            }
+        )
+        
+        (map-set dispute-vote-counts
+            { dispute-id: new-dispute-id }
+            {
+                complainant-votes: u0,
+                defendant-votes: u0,
+                total-votes: u0
+            }
+        )
+        
+        (var-set last-dispute-id new-dispute-id)
+        (ok new-dispute-id)
+    )
+)
+
+(define-public (accept-mediation (dispute-id uint))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err u505)))
+            (validator-info (unwrap! (map-get? validators { validator: tx-sender }) (err u506)))
+        )
+        (asserts! (get is-active validator-info) (err u507))
+        (asserts! (is-eq (get status dispute) "open") (err u508))
+        (asserts! (is-none (get mediator dispute)) (err u509))
+        
+        (map-set disputes
+            { dispute-id: dispute-id }
+            (merge dispute {
+                mediator: (some tx-sender),
+                status: "in-mediation"
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (vote-on-dispute (dispute-id uint) (vote-for-complainant bool))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err u510)))
+            (validator-info (unwrap! (map-get? validators { validator: tx-sender }) (err u511)))
+            (vote-counts (unwrap! (map-get? dispute-vote-counts { dispute-id: dispute-id }) (err u512)))
+        )
+        (asserts! (get is-active validator-info) (err u513))
+        (asserts! (is-eq (get status dispute) "in-mediation") (err u514))
+        (asserts! (is-none (map-get? dispute-votes { dispute-id: dispute-id, voter: tx-sender })) (err u515))
+        
+        (map-set dispute-votes
+            { dispute-id: dispute-id, voter: tx-sender }
+            { vote-for-complainant: vote-for-complainant }
+        )
+        
+        (map-set dispute-vote-counts
+            { dispute-id: dispute-id }
+            {
+                complainant-votes: (if vote-for-complainant (+ (get complainant-votes vote-counts) u1) (get complainant-votes vote-counts)),
+                defendant-votes: (if vote-for-complainant (get defendant-votes vote-counts) (+ (get defendant-votes vote-counts) u1)),
+                total-votes: (+ (get total-votes vote-counts) u1)
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint) (resolution-text (string-ascii 200)))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err u516)))
+            (vote-counts (unwrap! (map-get? dispute-vote-counts { dispute-id: dispute-id }) (err u517)))
+            (complainant-wins (> (get complainant-votes vote-counts) (get defendant-votes vote-counts)))
+        )
+        (asserts! (is-eq (some tx-sender) (get mediator dispute)) (err u518))
+        (asserts! (is-eq (get status dispute) "in-mediation") (err u519))
+        (asserts! (>= (get total-votes vote-counts) u3) (err u520))
+        (asserts! (>= (len resolution-text) u10) (err u521))
+        
+        (map-set disputes
+            { dispute-id: dispute-id }
+            (merge dispute {
+                status: "resolved",
+                resolution: (some resolution-text),
+                resolved-at: (some burn-block-height)
+            })
+        )
+        
+        (if complainant-wins
+            (try! (as-contract (stx-transfer? (get stake-amount dispute) tx-sender (get complainant dispute))))
+            (try! (as-contract (stx-transfer? (get stake-amount dispute) tx-sender (get defendant dispute))))
+        )
+        
+        (ok complainant-wins)
+    )
+)
+
+(define-public (respond-to-dispute (dispute-id uint) (response-ipfs (string-ascii 64)))
+    (let
+        ((dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err u522))))
+        (asserts! (is-eq tx-sender (get defendant dispute)) (err u523))
+        (asserts! (is-eq (get status dispute) "open") (err u524))
+        (asserts! (>= (len response-ipfs) u1) (err u525))
+        
+        (try! (stx-transfer? (get stake-amount dispute) tx-sender (as-contract tx-sender)))
+        
+        (map-set disputes
+            { dispute-id: dispute-id }
+            (merge dispute { status: "contested" })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-dispute-votes (dispute-id uint))
+    (map-get? dispute-vote-counts { dispute-id: dispute-id })
+)
+
+(define-read-only (has-voted-on-dispute (dispute-id uint) (voter principal))
+    (is-some (map-get? dispute-votes { dispute-id: dispute-id, voter: voter }))
+)
+
+(define-read-only (get-total-disputes)
+    (var-get last-dispute-id)
+)
+
+(define-read-only (get-dispute-by-creation (creation-id uint) (search-dispute-id uint))
+    (let
+        ((dispute (map-get? disputes { dispute-id: search-dispute-id })))
+        (if (is-some dispute)
+            (if (is-eq creation-id (get creation-id (unwrap-panic dispute)))
+                dispute
+                none
+            )
+            none
+        )
+    )
+)
+
+(define-data-var batch-operation-count uint u0)
+
+(define-map batch-operations
+    { batch-id: uint }
+    {
+        operator: principal,
+        operation-type: (string-ascii 20),
+        items-count: uint,
+        executed-at: uint,
+        total-cost: uint
+    }
+)
+
+(define-private (register-single-creation-internal (creation-data { ipfs-hash: (string-ascii 64), title: (string-ascii 100), category: (string-ascii 20) }))
+    (let
+        (
+            (new-id (+ (var-get last-creation-id) u1))
+            (creator tx-sender)
+            (existing-works (default-to { work-ids: (list) } (map-get? creator-works { creator: tx-sender })))
+        )
+        (asserts! (>= (len (get ipfs-hash creation-data)) u1) (err u1))
+        (asserts! (>= (len (get title creation-data)) u1) (err u2))
+        (asserts! (>= (len (get category creation-data)) u1) (err u3))
+        
+        (map-set creations
+            { creation-id: new-id }
+            {
+                owner: creator,
+                ipfs-hash: (get ipfs-hash creation-data),
+                title: (get title creation-data),
+                timestamp: burn-block-height,
+                category: (get category creation-data)
+            }
+        )
+        
+        (map-set creator-works
+            { creator: creator }
+            { work-ids: (unwrap-panic (as-max-len? (append (get work-ids existing-works) new-id) u100)) }
+        )
+        
+        (var-set last-creation-id new-id)
+        (ok new-id)
+    )
+)
+
+(define-public (batch-register-creations (creations-list (list 10 { ipfs-hash: (string-ascii 64), title: (string-ascii 100), category: (string-ascii 20) })))
+    (let
+        (
+            (batch-id (+ (var-get batch-operation-count) u1))
+            (items-count (len creations-list))
+        )
+        (asserts! (> items-count u0) (err u600))
+        
+        (let
+            ((results (map register-single-creation-internal creations-list)))
+            
+            (map-set batch-operations
+                { batch-id: batch-id }
+                {
+                    operator: tx-sender,
+                    operation-type: "batch-register",
+                    items-count: items-count,
+                    executed-at: burn-block-height,
+                    total-cost: u0
+                }
+            )
+            
+            (var-set batch-operation-count batch-id)
+            (ok { batch-id: batch-id, results: results })
+        )
+    )
+)
+
+(define-private (purchase-single-license-internal (license-data { creation-id: uint, license-type: (string-ascii 20) }))
+    (let
+        (
+            (creation (unwrap! (get-creation (get creation-id license-data)) (err u203)))
+            (royalty-info (unwrap! (map-get? creation-royalties { creation-id: (get creation-id license-data) }) (err u204)))
+            (license-price (get license-price royalty-info))
+            (creator (get owner creation))
+            (new-license-id (+ (var-get last-license-id) u1))
+            (platform-fee (/ (* license-price (var-get platform-fee-percentage)) u10000))
+            (creator-payment (- license-price platform-fee))
+        )
+        (asserts! (get is-for-sale royalty-info) (err u205))
+        (asserts! (not (is-eq tx-sender creator)) (err u206))
+        
+        (try! (stx-transfer? license-price tx-sender (as-contract tx-sender)))
+        (try! (as-contract (stx-transfer? creator-payment tx-sender creator)))
+        
+        (map-set licenses
+            { license-id: new-license-id }
+            {
+                creation-id: (get creation-id license-data),
+                licensee: tx-sender,
+                license-type: (get license-type license-data),
+                price-paid: license-price,
+                expires-at: none,
+                granted-at: burn-block-height
+            }
+        )
+        
+        (let
+            ((current-earnings (default-to { total-earned: u0 } (map-get? royalty-earnings { creator: creator }))))
+            (map-set royalty-earnings
+                { creator: creator }
+                { total-earned: (+ (get total-earned current-earnings) creator-payment) }
+            )
+        )
+        
+        (var-set last-license-id new-license-id)
+        (ok new-license-id)
+    )
+)
+
+(define-public (batch-purchase-licenses (licenses-list (list 10 { creation-id: uint, license-type: (string-ascii 20) })))
+    (let
+        (
+            (batch-id (+ (var-get batch-operation-count) u1))
+            (items-count (len licenses-list))
+        )
+        (asserts! (> items-count u0) (err u601))
+        
+        (let
+            ((results (map purchase-single-license-internal licenses-list)))
+            
+            (map-set batch-operations
+                { batch-id: batch-id }
+                {
+                    operator: tx-sender,
+                    operation-type: "batch-license",
+                    items-count: items-count,
+                    executed-at: burn-block-height,
+                    total-cost: u0
+                }
+            )
+            
+            (var-set batch-operation-count batch-id)
+            (ok { batch-id: batch-id, results: results })
+        )
+    )
+)
+
+(define-private (transfer-single-creation-internal (transfer-data { creation-id: uint, new-owner: principal }))
+    (let
+        ((creation (map-get? creations { creation-id: (get creation-id transfer-data) })))
+        (asserts! (is-some creation) (err u5))
+        (asserts! (is-eq tx-sender (get owner (unwrap-panic creation))) (err u6))
+        
+        (map-set creations
+            { creation-id: (get creation-id transfer-data) }
+            (merge (unwrap-panic creation) { owner: (get new-owner transfer-data) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (batch-transfer-creations (transfers-list (list 10 { creation-id: uint, new-owner: principal })))
+    (let
+        (
+            (batch-id (+ (var-get batch-operation-count) u1))
+            (items-count (len transfers-list))
+        )
+        (asserts! (> items-count u0) (err u602))
+        
+        (let
+            ((results (map transfer-single-creation-internal transfers-list)))
+            
+            (map-set batch-operations
+                { batch-id: batch-id }
+                {
+                    operator: tx-sender,
+                    operation-type: "batch-transfer",
+                    items-count: items-count,
+                    executed-at: burn-block-height,
+                    total-cost: u0
+                }
+            )
+            
+            (var-set batch-operation-count batch-id)
+            (ok { batch-id: batch-id, results: results })
+        )
+    )
+)
+
+(define-read-only (get-batch-operation (batch-id uint))
+    (map-get? batch-operations { batch-id: batch-id })
+)
+
+(define-read-only (get-total-batch-operations)
+    (var-get batch-operation-count)
+)
