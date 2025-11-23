@@ -891,3 +891,196 @@
         )
     )
 )
+
+(define-data-var batch-operation-count uint u0)
+
+(define-map batch-operations
+    { batch-id: uint }
+    {
+        operator: principal,
+        operation-type: (string-ascii 20),
+        items-count: uint,
+        executed-at: uint,
+        total-cost: uint
+    }
+)
+
+(define-private (register-single-creation-internal (creation-data { ipfs-hash: (string-ascii 64), title: (string-ascii 100), category: (string-ascii 20) }))
+    (let
+        (
+            (new-id (+ (var-get last-creation-id) u1))
+            (creator tx-sender)
+            (existing-works (default-to { work-ids: (list) } (map-get? creator-works { creator: tx-sender })))
+        )
+        (asserts! (>= (len (get ipfs-hash creation-data)) u1) (err u1))
+        (asserts! (>= (len (get title creation-data)) u1) (err u2))
+        (asserts! (>= (len (get category creation-data)) u1) (err u3))
+        
+        (map-set creations
+            { creation-id: new-id }
+            {
+                owner: creator,
+                ipfs-hash: (get ipfs-hash creation-data),
+                title: (get title creation-data),
+                timestamp: burn-block-height,
+                category: (get category creation-data)
+            }
+        )
+        
+        (map-set creator-works
+            { creator: creator }
+            { work-ids: (unwrap-panic (as-max-len? (append (get work-ids existing-works) new-id) u100)) }
+        )
+        
+        (var-set last-creation-id new-id)
+        (ok new-id)
+    )
+)
+
+(define-public (batch-register-creations (creations-list (list 10 { ipfs-hash: (string-ascii 64), title: (string-ascii 100), category: (string-ascii 20) })))
+    (let
+        (
+            (batch-id (+ (var-get batch-operation-count) u1))
+            (items-count (len creations-list))
+        )
+        (asserts! (> items-count u0) (err u600))
+        
+        (let
+            ((results (map register-single-creation-internal creations-list)))
+            
+            (map-set batch-operations
+                { batch-id: batch-id }
+                {
+                    operator: tx-sender,
+                    operation-type: "batch-register",
+                    items-count: items-count,
+                    executed-at: burn-block-height,
+                    total-cost: u0
+                }
+            )
+            
+            (var-set batch-operation-count batch-id)
+            (ok { batch-id: batch-id, results: results })
+        )
+    )
+)
+
+(define-private (purchase-single-license-internal (license-data { creation-id: uint, license-type: (string-ascii 20) }))
+    (let
+        (
+            (creation (unwrap! (get-creation (get creation-id license-data)) (err u203)))
+            (royalty-info (unwrap! (map-get? creation-royalties { creation-id: (get creation-id license-data) }) (err u204)))
+            (license-price (get license-price royalty-info))
+            (creator (get owner creation))
+            (new-license-id (+ (var-get last-license-id) u1))
+            (platform-fee (/ (* license-price (var-get platform-fee-percentage)) u10000))
+            (creator-payment (- license-price platform-fee))
+        )
+        (asserts! (get is-for-sale royalty-info) (err u205))
+        (asserts! (not (is-eq tx-sender creator)) (err u206))
+        
+        (try! (stx-transfer? license-price tx-sender (as-contract tx-sender)))
+        (try! (as-contract (stx-transfer? creator-payment tx-sender creator)))
+        
+        (map-set licenses
+            { license-id: new-license-id }
+            {
+                creation-id: (get creation-id license-data),
+                licensee: tx-sender,
+                license-type: (get license-type license-data),
+                price-paid: license-price,
+                expires-at: none,
+                granted-at: burn-block-height
+            }
+        )
+        
+        (let
+            ((current-earnings (default-to { total-earned: u0 } (map-get? royalty-earnings { creator: creator }))))
+            (map-set royalty-earnings
+                { creator: creator }
+                { total-earned: (+ (get total-earned current-earnings) creator-payment) }
+            )
+        )
+        
+        (var-set last-license-id new-license-id)
+        (ok new-license-id)
+    )
+)
+
+(define-public (batch-purchase-licenses (licenses-list (list 10 { creation-id: uint, license-type: (string-ascii 20) })))
+    (let
+        (
+            (batch-id (+ (var-get batch-operation-count) u1))
+            (items-count (len licenses-list))
+        )
+        (asserts! (> items-count u0) (err u601))
+        
+        (let
+            ((results (map purchase-single-license-internal licenses-list)))
+            
+            (map-set batch-operations
+                { batch-id: batch-id }
+                {
+                    operator: tx-sender,
+                    operation-type: "batch-license",
+                    items-count: items-count,
+                    executed-at: burn-block-height,
+                    total-cost: u0
+                }
+            )
+            
+            (var-set batch-operation-count batch-id)
+            (ok { batch-id: batch-id, results: results })
+        )
+    )
+)
+
+(define-private (transfer-single-creation-internal (transfer-data { creation-id: uint, new-owner: principal }))
+    (let
+        ((creation (map-get? creations { creation-id: (get creation-id transfer-data) })))
+        (asserts! (is-some creation) (err u5))
+        (asserts! (is-eq tx-sender (get owner (unwrap-panic creation))) (err u6))
+        
+        (map-set creations
+            { creation-id: (get creation-id transfer-data) }
+            (merge (unwrap-panic creation) { owner: (get new-owner transfer-data) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (batch-transfer-creations (transfers-list (list 10 { creation-id: uint, new-owner: principal })))
+    (let
+        (
+            (batch-id (+ (var-get batch-operation-count) u1))
+            (items-count (len transfers-list))
+        )
+        (asserts! (> items-count u0) (err u602))
+        
+        (let
+            ((results (map transfer-single-creation-internal transfers-list)))
+            
+            (map-set batch-operations
+                { batch-id: batch-id }
+                {
+                    operator: tx-sender,
+                    operation-type: "batch-transfer",
+                    items-count: items-count,
+                    executed-at: burn-block-height,
+                    total-cost: u0
+                }
+            )
+            
+            (var-set batch-operation-count batch-id)
+            (ok { batch-id: batch-id, results: results })
+        )
+    )
+)
+
+(define-read-only (get-batch-operation (batch-id uint))
+    (map-get? batch-operations { batch-id: batch-id })
+)
+
+(define-read-only (get-total-batch-operations)
+    (var-get batch-operation-count)
+)
